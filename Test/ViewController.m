@@ -201,8 +201,8 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         self.logView.alpha = 1.0;
     }];
 
-    [self setStatus:@"UAF characterize (controlled reclaim)..."];
-    [self uafCharacterize];
+    [self setStatus:@"Path 3B: three-condition slot control..."];
+    [self triggerPath3B];
 }
 
 #pragma mark - Status
