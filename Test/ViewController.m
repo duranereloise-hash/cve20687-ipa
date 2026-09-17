@@ -201,8 +201,8 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         self.logView.alpha = 1.0;
     }];
 
-    [self setStatus:@"Spraying..."];
-    [self sprayLeak:1000];
+    [self setStatus:@"UAF characterize (controlled reclaim)..."];
+    [self uafCharacterize];
 }
 
 #pragma mark - Status
