@@ -2052,7 +2052,7 @@ done:
             for(int r=0;r<rn;r++) IOServiceClose(rcs[r]);
         }
 
-        auto sort = ^(uint64_t *arr, int n) { for(int i=0;i<n-1;i++) for(int j=i+1;j<n;j++) if(arr[i]>arr[j]){uint64_t t=arr[i];arr[i]=arr[j];arr[j]=t;} };
+        void (^sort)(uint64_t *, int) = ^(uint64_t *arr, int n) { for(int i=0;i<n-1;i++) for(int j=i+1;j<n;j++) if(arr[i]>arr[j]){uint64_t t=arr[i];arr[i]=arr[j];arr[j]=t;} };
         sort(timP0, np0); sort(timP1, np1);
         uint64_t m0=np0?timP0[np0/2]:0, m1=np1?timP1[np1/2]:0;
         [self log:@"  RESULT prog0=%llu prog1=%llu us diff=%+lld", m0, m1, (int64_t)m1-(int64_t)m0];
