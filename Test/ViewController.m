@@ -1785,7 +1785,7 @@ done:
 - (void)runPath3BTimed:(io_service_t)svc vS:(uint32_t)vS vD:(uint32_t)vD
                     rS:(uint32_t)rS rD:(uint32_t)rD W:(uint32_t)W H:(uint32_t)H
 {
-    const int DOSE = 5, CYCLES = 20, R_CONNS = 3, R_REQS = 5;
+    const int DOSE = 5, CYCLES = 6, R_CONNS = 3, R_REQS = 5;
     uint64_t timA[CYCLES], timB[CYCLES], timC[CYCLES];
     int nA=0, nB=0, nC=0;
 
@@ -1842,7 +1842,7 @@ done:
 - (void)runPath3BEncode:(io_service_t)svc vS:(uint32_t)vS vD:(uint32_t)vD
                     rS:(uint32_t)rS rD:(uint32_t)rD W:(uint32_t)W H:(uint32_t)H
 {
-    const int DOSE = 5, CYCLES = 15, R_CONNS = 3, R_REQS = 5;
+    const int DOSE = 5, CYCLES = 4, R_CONNS = 3, R_REQS = 5;
     uint64_t timA[CYCLES], timB[CYCLES];
     int nA=0, nB=0;
     mach_timebase_info_data_t tbi; mach_timebase_info(&tbi);
@@ -1888,7 +1888,7 @@ done:
 - (void)runProgressiveReclaim:(io_service_t)svc vS:(uint32_t)vS vD:(uint32_t)vD
                            rS:(uint32_t)rS rD:(uint32_t)rD W:(uint32_t)W H:(uint32_t)H
 {
-    const int DOSE=5, CYCLES=30, R_CONNS=3, R_REQS=5;
+    const int DOSE=5, CYCLES=8, R_CONNS=3, R_REQS=5;
     mach_timebase_info_data_t tbi; mach_timebase_info(&tbi);
     uint64_t (^syncTrigger)(void) = ^uint64_t{
         io_connect_t t=[self openUC:svc]; if(!t) return 0;
@@ -1925,7 +1925,7 @@ done:
 - (void)runRace:(io_service_t)svc vS:(uint32_t)vS vD:(uint32_t)vD
              rS:(uint32_t)rS rD:(uint32_t)rD W:(uint32_t)W H:(uint32_t)H
 {
-    const int ITERS = 100;
+    const int ITERS = 40;
     __block int32_t vDone = 0, rDone = 0;
     dispatch_group_t group = dispatch_group_create();
 
