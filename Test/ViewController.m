@@ -1932,28 +1932,28 @@ done:
     dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         for (int i=0;i<ITERS && self.running;i++) {
             io_connect_t vc=[self openUC:svc];
-            if(vc){ [self submitAsyncRequests:vc srcID:vS dstID:vD width:W height:H count:5 tokenBase:0xDEAD+i]; IOServiceClose(vc); }
+            if(vc){ [self submitAsyncRequests:vc srcID:vS dstID:vD width:W height:H count:5 tokenBase:(0xDEAD + i)]; IOServiceClose(vc); }
             __sync_fetch_and_add(&vDone,1);
         }
     });
     dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         for (int i=0;i<ITERS && self.running;i++) {
             io_connect_t rc=[self openUC:svc];
-            if(rc){ [self submitAsyncRequests:rc srcID:rS dstID:rD width:W height:H count:5 tokenBase:0xCAFE+i]; IOServiceClose(rc); }
+            if(rc){ [self submitAsyncRequests:rc srcID:rS dstID:rD width:W height:H count:5 tokenBase:(0xCAFE + i)]; IOServiceClose(rc); }
             __sync_fetch_and_add(&rDone,1);
         }
     });
     dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         for (int i=0;i<ITERS && self.running;i++) {
             io_connect_t rc=[self openUC:svc];
-            if(rc){ [self submitAsyncRequests:rc srcID:rS dstID:rD width:W height:H count:5 tokenBase:0xBEEF+i]; IOServiceClose(rc); }
+            if(rc){ [self submitAsyncRequests:rc srcID:rS dstID:rD width:W height:H count:5 tokenBase:(0xBEEF + i)]; IOServiceClose(rc); }
             __sync_fetch_and_add(&rDone,1);
         }
     });
     dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         for (int i=0;i<ITERS && self.running;i++) {
             io_connect_t vc=[self openUC:svc];
-            if(vc){ [self submitAsyncRequestsFlags:vc srcID:vS dstID:vD width:W height:H count:5 tokenBase:0xAAAA+i progressive:YES]; IOServiceClose(vc); }
+            if(vc){ [self submitAsyncRequestsFlags:vc srcID:vS dstID:vD width:W height:H count:5 tokenBase:(0xAAAA + i) progressive:YES]; IOServiceClose(vc); }
             __sync_fetch_and_add(&vDone,1);
         }
     });
