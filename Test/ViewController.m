@@ -123,6 +123,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 @property (nonatomic, strong) UIButton *panicButton;
 @property (nonatomic, strong) UIButton *rcButton;
 @property (nonatomic, strong) UIButton *p3bButton;
+@property (nonatomic, strong) UIButton *runAllBtn;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, assign) BOOL running;
 @end
@@ -174,6 +175,17 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [p3bButton addTarget:self action:@selector(triggerPath3B) forControlEvents:UIControlEventTouchUpInside];
     self.p3bButton = p3bButton;
 
+    // RUN ALL button: универсальный прогон всех тестов
+    UIButton *runAllBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [runAllBtn setTitle:@"RUN ALL" forState:UIControlStateNormal];
+    runAllBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    runAllBtn.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
+    runAllBtn.layer.cornerRadius = 10;
+    [runAllBtn setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+    runAllBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [runAllBtn addTarget:self action:@selector(runAllTests) forControlEvents:UIControlEventTouchUpInside];
+    self.runAllBtn = runAllBtn;
+
     // Hidden log view (still captures NSLog output for debugging)
     self.logView = [[UITextView alloc] init];
     self.logView.editable = NO;
@@ -189,6 +201,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [self.view addSubview:self.logView];
     [self.view addSubview:self.rcButton];
     [self.view addSubview:self.p3bButton];
+    [self.view addSubview:self.runAllBtn];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -211,6 +224,10 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         [self.p3bButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
         [self.p3bButton.widthAnchor constraintEqualToConstant:150],
         [self.p3bButton.heightAnchor constraintEqualToConstant:44],
+        [self.runAllBtn.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [self.runAllBtn.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:120],
+        [self.runAllBtn.widthAnchor constraintEqualToConstant:200],
+        [self.runAllBtn.heightAnchor constraintEqualToConstant:52],
     ]];
 }
 
@@ -1669,6 +1686,281 @@ done:
         IOObjectRelease(svc);
         self.running = NO;
     });
+}
+
+#pragma mark - Run All (универсальный тест-раннер)
+
+// Единый прогон всех проверок JPEG-драйвера. Запускается одной кнопкой.
+// Каждый под-тест изолирован, между ними health-check + запись в файл и на экран.
+- (void)runAllTests {
+    if (self.running) return;
+    self.running = YES;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.logView.alpha = 1.0;
+        [self setStatus:@"RUN ALL..."];
+    });
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self log:@"\n\n########## RUN ALL ##########"];
+        [self log:@"device: %@ %@", [[UIDevice currentDevice] systemVersion],
+            [[UIDevice currentDevice] model]];
+
+        io_service_t svc = [self findJPEGService];
+        if (!svc) { [self log:@"Service not found"]; self.running = NO; return; }
+        BOOL healthy = [self checkDriverHealth:svc];
+        [self log:@"driver health: %@", healthy ? @"OK" : @"BROKEN"];
+        if (!healthy) { IOObjectRelease(svc); self.running = NO; return; }
+
+        const uint32_t W = 2048, H = 2048;
+        NSData *jpegData = [self createTestJPEG:W height:H];
+        IOSurfaceRef vSrc = [self createSourceSurface:jpegData];
+        IOSurfaceRef vDst = [self createDestSurface:W height:H];
+        IOSurfaceRef rSrc = [self createSourceSurface:jpegData];
+        IOSurfaceRef rDst = [self createDestSurface:W height:H];
+        if (!vSrc || !vDst || !rSrc || !rDst) {
+            [self log:@"surface creation failed"];
+            IOObjectRelease(svc); self.running = NO; return;
+        }
+        uint32_t vS = IOSurfaceGetID(vSrc), vD = IOSurfaceGetID(vDst);
+        uint32_t rS = IOSurfaceGetID(rSrc), rD = IOSurfaceGetID(rDst);
+        [self log:@"surfs v=%u/%u r=%u/%u", vS, vD, rS, rD];
+
+        // ---------- 1) PROBE: селекторы ----------
+        [self log:@"\n--- 1) PROBE selectors ---"];
+        io_connect_t pc = [self openUC:svc];
+        if (pc) {
+            // sel0 getTarget (no args)
+            kern_return_t kr0 = IOConnectCallMethod(pc, 0, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
+            [self log:@"  sel0 (getTarget): 0x%x", kr0];
+            // sel2 query
+            kern_return_t kr2 = IOConnectCallMethod(pc, 2, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
+            [self log:@"  sel2 (query): 0x%x", kr2];
+            // sel1 decode sync (token=0) — ждём 0xe00002d1 StillOpen
+            AppleJPEGDriverIOStruct in = {0}, out = {0};
+            in.sourceID = rS; in.field_04 = W*H; in.destID = rD; in.field_0C = W*H*4;
+            in.width = W; in.height = H; in.outWidth = W; in.outHeight = H;
+            in.subsampling = 3; in.asyncToken = 0;
+            size_t os = sizeof(out);
+            kern_return_t kr1 = IOConnectCallStructMethod(pc, 1, &in, sizeof(in), &out, &os);
+            [self log:@"  sel1 decode token=0: 0x%x", kr1];
+            // sel3 encode
+            in.asyncToken = 0x4141;
+            kern_return_t kr3 = IOConnectCallStructMethod(pc, 3, &in, sizeof(in), &out, &os);
+            [self log:@"  sel3 encode: 0x%x", kr3];
+            IOServiceClose(pc);
+        }
+        healthy = [self checkDriverHealth:svc];
+        [self log:@"  health after probe: %@", healthy ? @"OK" : @"BROKEN"];
+
+        // ---------- 2) P3B TIMING (decode) ----------
+        [self log:@"\n--- 2) P3B timing (decode) ---"];
+        [self runPath3BTimed:svc vS:vS vD:vD rS:rS rD:rD W:W H:H];
+
+        // ---------- 3) P3B TIMING (encode, sel 3) ----------
+        [self log:@"\n--- 3) P3B timing (encode sel3) ---"];
+        [self runPath3BEncode:svc vS:vS vD:vD rS:rS rD:rD W:W H:H];
+
+        // ---------- 4) PROGRESSIVE RECLAIM ----------
+        [self log:@"\n--- 4) progressive reclaim (prog=1) ---"];
+        [self runProgressiveReclaim:svc vS:vS vD:vD rS:rS rD:rD W:W H:H];
+
+        // ---------- 5) RACE ----------
+        [self log:@"\n--- 5) race (4 threads x 100) ---"];
+        [self runRace:svc vS:vS vD:vD rS:rS rD:rD W:W H:H];
+
+        CFRelease(vSrc); CFRelease(vDst); CFRelease(rSrc); CFRelease(rDst);
+        IOObjectRelease(svc);
+        self.running = NO;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self setStatus:@"RUN ALL DONE"];
+            self.statusLabel.font = [UIFont boldSystemFontOfSize:16];
+        });
+        [self log:@"########## RUN ALL DONE ##########"];
+    });
+}
+
+// P3B тайминг decode: A/B/C медианы
+- (void)runPath3BTimed:(io_service_t)svc vS:(uint32_t)vS vD:(uint32_t)vD
+                    rS:(uint32_t)rS rD:(uint32_t)rD W:(uint32_t)W H:(uint32_t)H
+{
+    const int DOSE = 5, CYCLES = 20, R_CONNS = 3, R_REQS = 5;
+    uint64_t timA[CYCLES], timB[CYCLES], timC[CYCLES];
+    int nA=0, nB=0, nC=0;
+
+    mach_timebase_info_data_t tbi; mach_timebase_info(&tbi);
+    uint64_t (^syncTrigger)(void) = ^uint64_t{
+        io_connect_t t = [self openUC:svc];
+        if (!t) return 0;
+        AppleJPEGDriverIOStruct in = {0}, out = {0};
+        in.sourceID = rS; in.field_04 = W*H; in.destID = rD; in.field_0C = W*H*4;
+        in.width = W; in.height = H; in.outWidth = W; in.outHeight = H;
+        in.subsampling = 3; in.asyncToken = 0;
+        size_t os = sizeof(out);
+        uint64_t t0 = mach_absolute_time();
+        IOConnectCallStructMethod(t, 1, &in, sizeof(in), &out, &os);
+        uint64_t t1 = mach_absolute_time();
+        IOServiceClose(t);
+        return (t1-t0) * tbi.numer / tbi.denom / 1000;
+    };
+
+    [self log:@"  A: victim no-reclaim..."];
+    for (int c = 0; c < CYCLES; c++) {
+        io_connect_t vc = [self openUC:svc];
+        if (vc) { [self submitAsyncRequests:vc srcID:vS dstID:vD width:W height:H count:DOSE tokenBase:0xA000+c]; IOServiceClose(vc); }
+        usleep(2000);
+        uint64_t us = syncTrigger(); if (us) timA[nA++] = us;
+    }
+    [self log:@"  B: victim+reclaim..."];
+    for (int c = 0; c < CYCLES; c++) {
+        io_connect_t vc = [self openUC:svc];
+        if (vc) { [self submitAsyncRequests:vc srcID:vS dstID:vD width:W height:H count:DOSE tokenBase:0xC000+c]; IOServiceClose(vc); }
+        usleep(2000);
+        io_connect_t rcs[R_CONNS]; int rcN=0;
+        for (int r=0; r<R_CONNS; r++) { io_connect_t rc=[self openUC:svc]; if(rc){ [self submitAsyncRequests:rc srcID:rS dstID:rD width:W height:H count:R_REQS tokenBase:0xD000+c*0x10+r]; rcs[rcN++]=rc; } }
+        uint64_t us = syncTrigger(); if (us) timB[nB++] = us;
+        for (int r=0; r<rcN; r++) IOServiceClose(rcs[r]);
+    }
+    [self log:@"  C: no-victim reclaim..."];
+    for (int c = 0; c < CYCLES; c++) {
+        io_connect_t rcs[R_CONNS]; int rcN=0;
+        for (int r=0; r<R_CONNS; r++) { io_connect_t rc=[self openUC:svc]; if(rc){ [self submitAsyncRequests:rc srcID:rS dstID:rD width:W height:H count:R_REQS tokenBase:0xE000+c*0x10+r]; rcs[rcN++]=rc; } }
+        uint64_t us = syncTrigger(); if (us) timC[nC++] = us;
+        for (int r=0; r<rcN; r++) IOServiceClose(rcs[r]);
+    }
+    // sort
+    for (int i=0;i<nA-1;i++) for (int j=i+1;j<nA;j++) if(timA[i]>timA[j]){uint64_t t=timA[i];timA[i]=timA[j];timA[j]=t;}
+    for (int i=0;i<nB-1;i++) for (int j=i+1;j<nB;j++) if(timB[i]>timB[j]){uint64_t t=timB[i];timB[i]=timB[j];timB[j]=t;}
+    for (int i=0;i<nC-1;i++) for (int j=i+1;j<nC;j++) if(timC[i]>timC[j]){uint64_t t=timC[i];timC[i]=timC[j];timC[j]=t;}
+    uint64_t mA = nA?timA[nA/2]:0, mB = nB?timB[nB/2]:0, mC = nC?timC[nC/2]:0;
+    [self log:@"  RESULT A=%llu B=%llu C=%llu us | B-C=%lld  health=%@",
+        mA, mB, mC, (int64_t)mB-(int64_t)mC, [self checkDriverHealth:svc]?@"OK":@"BROKEN"];
+}
+
+// P3B тайминг encode (sel 3)
+- (void)runPath3BEncode:(io_service_t)svc vS:(uint32_t)vS vD:(uint32_t)vD
+                    rS:(uint32_t)rS rD:(uint32_t)rD W:(uint32_t)W H:(uint32_t)H
+{
+    const int DOSE = 5, CYCLES = 15, R_CONNS = 3, R_REQS = 5;
+    uint64_t timA[CYCLES], timB[CYCLES];
+    int nA=0, nB=0;
+    mach_timebase_info_data_t tbi; mach_timebase_info(&tbi);
+
+    uint64_t (^encTrigger)(void) = ^uint64_t{
+        io_connect_t t = [self openUC:svc];
+        if (!t) return 0;
+        AppleJPEGDriverIOStruct in = {0}, out = {0};
+        in.sourceID = rD; in.field_04 = W*H*4; in.destID = rS; in.field_0C = W*H;
+        in.width = W; in.height = H; in.outWidth = W; in.outHeight = H;
+        in.subsampling = 3; in.asyncToken = 0x4141;
+        size_t os = sizeof(out);
+        uint64_t t0 = mach_absolute_time();
+        IOConnectCallStructMethod(t, 3, &in, sizeof(in), &out, &os);
+        uint64_t t1 = mach_absolute_time();
+        IOServiceClose(t);
+        return (t1-t0) * tbi.numer / tbi.denom / 1000;
+    };
+
+    [self log:@"  A: encode no-reclaim..."];
+    for (int c=0;c<CYCLES;c++) {
+        io_connect_t vc=[self openUC:svc];
+        if(vc){ [self submitEncodeRequests:vc srcID:vD dstID:vS width:W height:H count:DOSE tokenBase:0xA000+c]; IOServiceClose(vc); }
+        usleep(2000); uint64_t us=encTrigger(); if(us) timA[nA++]=us;
+    }
+    [self log:@"  B: encode+reclaim..."];
+    for (int c=0;c<CYCLES;c++) {
+        io_connect_t vc=[self openUC:svc];
+        if(vc){ [self submitEncodeRequests:vc srcID:vD dstID:vS width:W height:H count:DOSE tokenBase:0xC000+c]; IOServiceClose(vc); }
+        usleep(2000);
+        io_connect_t rcs[R_CONNS]; int rcN=0;
+        for(int r=0;r<R_CONNS;r++){ io_connect_t rc=[self openUC:svc]; if(rc){ [self submitEncodeRequests:rc srcID:rD dstID:rS width:W height:H count:R_REQS tokenBase:0xD000+c*0x10+r]; rcs[rcN++]=rc; } }
+        uint64_t us=encTrigger(); if(us) timB[nB++]=us;
+        for(int r=0;r<rcN;r++) IOServiceClose(rcs[r]);
+    }
+    for(int i=0;i<nA-1;i++) for(int j=i+1;j<nA;j++) if(timA[i]>timA[j]){uint64_t t=timA[i];timA[i]=timA[j];timA[j]=t;}
+    for(int i=0;i<nB-1;i++) for(int j=i+1;j<nB;j++) if(timB[i]>timB[j]){uint64_t t=timB[i];timB[i]=timB[j];timB[j]=t;}
+    uint64_t mA=nA?timA[nA/2]:0, mB=nB?timB[nB/2]:0;
+    [self log:@"  RESULT encode A=%llu B=%llu us | B-A=%lld", mA, mB, (int64_t)mB-(int64_t)mA];
+}
+
+// Progressive reclaim: victim(prog0) + reclaim(prog1), тайминг
+- (void)runProgressiveReclaim:(io_service_t)svc vS:(uint32_t)vS vD:(uint32_t)vD
+                           rS:(uint32_t)rS rD:(uint32_t)rD W:(uint32_t)W H:(uint32_t)H
+{
+    const int DOSE=5, CYCLES=30, R_CONNS=3, R_REQS=5;
+    mach_timebase_info_data_t tbi; mach_timebase_info(&tbi);
+    uint64_t (^syncTrigger)(void) = ^uint64_t{
+        io_connect_t t=[self openUC:svc]; if(!t) return 0;
+        AppleJPEGDriverIOStruct in={0},out={0};
+        in.sourceID=rS; in.field_04=W*H; in.destID=rD; in.field_0C=W*H*4;
+        in.width=W; in.height=H; in.outWidth=W; in.outHeight=H;
+        in.subsampling=3; in.asyncToken=0;
+        size_t os=sizeof(out);
+        uint64_t t0=mach_absolute_time();
+        IOConnectCallStructMethod(t,1,&in,sizeof(in),&out,&os);
+        uint64_t t1=mach_absolute_time(); IOServiceClose(t);
+        return (t1-t0)*tbi.numer/tbi.denom/1000;
+    };
+    uint64_t tim[CYCLES]; int n=0;
+    for (int c=0;c<CYCLES && self.running;c++) {
+        io_connect_t vc=[self openUC:svc];
+        if(vc){ [self submitAsyncRequestsFlags:vc srcID:vS dstID:vD width:W height:H count:DOSE tokenBase:0xA000+c progressive:NO]; IOServiceClose(vc); }
+        usleep(2000);
+        io_connect_t rcs[R_CONNS]; int rcN=0;
+        for(int r=0;r<R_CONNS;r++){ io_connect_t rc=[self openUC:svc]; if(rc){ [self submitAsyncRequestsFlags:rc srcID:rS dstID:rD width:W height:H count:R_REQS tokenBase:0xC000+c*0x10+r progressive:YES]; rcs[rcN++]=rc; } }
+        uint64_t us=syncTrigger(); if(us) tim[n++]=us;
+        for(int r=0;r<rcN;r++) IOServiceClose(rcs[r]);
+        if((c+1)%15==0){
+            BOOL h=[self checkDriverHealth:svc];
+            [self log:@"  [%d] prog-reclaim health=%@", c+1, h?@"OK":@"BROKEN"];
+            if(!h) break;
+        }
+    }
+    BOOL h=[self checkDriverHealth:svc];
+    [self log:@"  RESULT prog-reclaim done, health=%@", h?@"OK":@"BROKEN"];
+}
+
+// Race: 4 потока, victim vs reclaim, 100 итераций
+- (void)runRace:(io_service_t)svc vS:(uint32_t)vS vD:(uint32_t)vD
+             rS:(uint32_t)rS rD:(uint32_t)rD W:(uint32_t)W H:(uint32_t)H
+{
+    const int ITERS = 100;
+    __block int32_t vDone = 0, rDone = 0;
+    dispatch_group_t group = dispatch_group_create();
+
+    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (int i=0;i<ITERS && self.running;i++) {
+            io_connect_t vc=[self openUC:svc];
+            if(vc){ [self submitAsyncRequests:vc srcID:vS dstID:vD width:W height:H count:5 tokenBase:0xDEAD+i]; IOServiceClose(vc); }
+            __sync_fetch_and_add(&vDone,1);
+        }
+    });
+    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (int i=0;i<ITERS && self.running;i++) {
+            io_connect_t rc=[self openUC:svc];
+            if(rc){ [self submitAsyncRequests:rc srcID:rS dstID:rD width:W height:H count:5 tokenBase:0xCAFE+i]; IOServiceClose(rc); }
+            __sync_fetch_and_add(&rDone,1);
+        }
+    });
+    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (int i=0;i<ITERS && self.running;i++) {
+            io_connect_t rc=[self openUC:svc];
+            if(rc){ [self submitAsyncRequests:rc srcID:rS dstID:rD width:W height:H count:5 tokenBase:0xBEEF+i]; IOServiceClose(rc); }
+            __sync_fetch_and_add(&rDone,1);
+        }
+    });
+    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (int i=0;i<ITERS && self.running;i++) {
+            io_connect_t vc=[self openUC:svc];
+            if(vc){ [self submitAsyncRequestsFlags:vc srcID:vS dstID:vD width:W height:H count:5 tokenBase:0xAAAA+i progressive:YES]; IOServiceClose(vc); }
+            __sync_fetch_and_add(&vDone,1);
+        }
+    });
+
+    dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 30*NSEC_PER_SEC));
+    BOOL h=[self checkDriverHealth:svc];
+    [self log:@"  RESULT race done v=%d r=%d health=%@", vDone, rDone, h?@"OK":@"BROKEN"];
 }
 
 @end
