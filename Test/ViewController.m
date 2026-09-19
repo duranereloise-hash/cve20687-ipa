@@ -122,6 +122,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIButton *panicButton;
 @property (nonatomic, strong) UIButton *rcButton;
+@property (nonatomic, strong) UIButton *p3bButton;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, assign) BOOL running;
 @end
@@ -162,6 +163,17 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [rcButton addTarget:self action:@selector(triggerReclaimCtrl) forControlEvents:UIControlEventTouchUpInside];
     self.rcButton = rcButton;
 
+    // P3B button: author's timing test (sync trigger medians A/B/C)
+    UIButton *p3bButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [p3bButton setTitle:@"P3B: timing" forState:UIControlStateNormal];
+    p3bButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    p3bButton.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1.0];
+    p3bButton.layer.cornerRadius = 10;
+    [p3bButton setTitleColor:[UIColor systemYellowColor] forState:UIControlStateNormal];
+    p3bButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [p3bButton addTarget:self action:@selector(triggerPath3B) forControlEvents:UIControlEventTouchUpInside];
+    self.p3bButton = p3bButton;
+
     // Hidden log view (still captures NSLog output for debugging)
     self.logView = [[UITextView alloc] init];
     self.logView.editable = NO;
@@ -176,6 +188,7 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [self.view addSubview:self.statusLabel];
     [self.view addSubview:self.logView];
     [self.view addSubview:self.rcButton];
+    [self.view addSubview:self.p3bButton];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -194,6 +207,10 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         [self.rcButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
         [self.rcButton.widthAnchor constraintEqualToConstant:150],
         [self.rcButton.heightAnchor constraintEqualToConstant:44],
+        [self.p3bButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [self.p3bButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
+        [self.p3bButton.widthAnchor constraintEqualToConstant:150],
+        [self.p3bButton.heightAnchor constraintEqualToConstant:44],
     ]];
 }
 
@@ -1111,6 +1128,11 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
         return;
     }
     self.running = YES;
+
+    [UIView animateWithDuration:0.2 animations:^{
+        self.logView.alpha = 1.0;
+    }];
+    [self setStatus:@"P3B timing..."];
 
     [self log:@"=== Path 3B: Reclaim vs No-Reclaim Stale Processing ==="];
 
