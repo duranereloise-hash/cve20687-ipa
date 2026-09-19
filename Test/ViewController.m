@@ -240,6 +240,23 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 
     NSLog(@"[PoC] %@", msg);
 
+    // также пишем в файл Documents/reclaim_log.txt (вытаскивается через AFC)
+    @try {
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *logPath = [docs stringByAppendingPathComponent:@"reclaim_log.txt"];
+        NSString *line = [msg stringByAppendingString:@"\n"];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        if (!fh) {
+            [line writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[PoC] file-log failed: %@", e);
+    }
+
     dispatch_async(dispatch_get_main_queue(), ^{
         self.logView.text = [self.logView.text stringByAppendingFormat:@"%@\n", msg];
         NSRange bottom = NSMakeRange(self.logView.text.length - 1, 1);
@@ -1511,6 +1528,12 @@ done:
 - (void)triggerReclaimCtrl {
     if (self.running) return;
     self.running = YES;
+
+    // Показать лог-область сразу
+    [UIView animateWithDuration:0.2 animations:^{
+        self.logView.alpha = 1.0;
+    }];
+    [self setStatus:@"RC: reclaim-ctrl..."];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self log:@"=== ReclaimCtrl: progressive-flag oracle ==="];
